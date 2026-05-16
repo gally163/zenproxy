@@ -1,19 +1,60 @@
 export async function onRequest(context) {
-      var request = context.request;
-      if (qualityFilter === "chatgpt" && !chatgptOk) return false;
+  var request = context.request;
+  var env = context.env;
+  var url = new URL(request.url);
 
-      if (
-        countryFilter &&
-        String(country || "").toUpperCase() !== countryFilter.toUpperCase()
-      ) {
+  var target = (url.searchParams.get("target") || "clash").toLowerCase();
+  var count = Number(url.searchParams.get("count") || "200");
+
+  var statusFilter = (url.searchParams.get("status") || "valid").toLowerCase();
+  var qualityFilter = (url.searchParams.get("quality") || "chatgpt").toLowerCase();
+
+  var countryFilter = url.searchParams.get("country");
+  var typeFilter = url.searchParams.get("type");
+
+  var riskMax = null;
+  if (url.searchParams.get("risk_max")) {
+    riskMax = Number(url.searchParams.get("risk_max"));
+  }
+
+  if (!env.ZENPROXY_BASE || !env.ZENPROXY_API_KEY) {
+    return textResponse("Missing ZENPROXY_BASE or ZENPROXY_API_KEY", 500);
+  }
+
+  try {
+    var allProxies = await fetchAllProxies(env);
+
+    var filtered = allProxies.filter(function (p) {
+      var status = String(p.status || "").toLowerCase();
+      var q = p.quality || {};
+
+      var chatgptOk =
+        q.chatgpt === true ||
+        q.chatgpt_accessible === true ||
+        q.openai === true;
+
+      var country = q.country || p.country || "";
+      var proxyType = p.type || p.proxy_type || "";
+      var risk = getRiskScore(q);
+
+      if (statusFilter === "valid" && status !== "valid") {
         return false;
       }
 
-      if (
-        typeFilter &&
-        String(type || "").toLowerCase() !== typeFilter.toLowerCase()
-      ) {
+      if (qualityFilter === "chatgpt" && !chatgptOk) {
         return false;
+      }
+
+      if (countryFilter) {
+        if (String(country).toUpperCase() !== countryFilter.toUpperCase()) {
+          return false;
+        }
+      }
+
+      if (typeFilter) {
+        if (String(proxyType).toLowerCase() !== typeFilter.toLowerCase()) {
+          return false;
+        }
       }
 
       if (riskMax !== null && risk !== null && risk > riskMax) {
@@ -26,18 +67,21 @@ export async function onRequest(context) {
     filtered = filtered.slice(0, count);
 
     if (!filtered.length) {
-      return text("No proxies matched: status=valid and quality=chatgpt", 404);
+      return textResponse("No proxies matched: status=valid and quality=chatgpt", 404);
     }
 
     var detailed = await fetchDetailedProxies(env, filtered);
 
     if (!detailed.length) {
-      return text("No detailed proxies fetched from /api/client/fetch", 404);
+      return textResponse("No detailed proxies fetched from /api/client/fetch", 404);
     }
 
     if (target === "v2ray" || target === "base64") {
-      var lines = detailed.map(toV2rayUri).filter(Boolean);
-      return new Response(base64Utf8(lines.join("\n")), {
+      var uriLines = detailed.map(toV2rayUri).filter(function (x) {
+        return !!x;
+      });
+
+      return new Response(base64Utf8(uriLines.join("\n")), {
         headers: {
           "content-type": "text/plain; charset=utf-8",
           "profile-update-interval": "6"
@@ -54,19 +98,19 @@ export async function onRequest(context) {
       }
     });
   } catch (err) {
-    return text("Error: " + (err.message || err), 500);
+    return textResponse("Error: " + String(err && err.message ? err.message : err), 500);
   }
 }
 
 async function fetchAllProxies(env) {
-  var apiBase = env.ZENPROXY_BASE.replace(/\/$/, "");
+  var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
   var url = new URL(apiBase + "/api/proxies");
 
   url.searchParams.set("api_key", env.ZENPROXY_API_KEY);
 
   var res = await fetch(url.toString(), {
     headers: {
-      Authorization: "Bearer " + env.ZENPROXY_API_KEY
+      "Authorization": "Bearer " + env.ZENPROXY_API_KEY
     }
   });
 
@@ -76,12 +120,23 @@ async function fetchAllProxies(env) {
 
   var data = await res.json();
 
-  var list =
-    data.proxies ||
-    data.data ||
-    data.items ||
-    data.results ||
-    [];
+  var list = [];
+
+  if (Array.isArray(data)) {
+    list = data;
+  } else if (Array.isArray(data.proxies)) {
+    list = data.proxies;
+  } else if (Array.isArray(data.data)) {
+    list = data.data;
+  } else if (Array.isArray(data.items)) {
+    list = data.items;
+  } else if (Array.isArray(data.results)) {
+    list = data.results;
+  } else if (data.data && Array.isArray(data.data.proxies)) {
+    list = data.data.proxies;
+  } else if (data.result && Array.isArray(data.result.proxies)) {
+    list = data.result.proxies;
+  }
 
   if (!Array.isArray(list)) {
     throw new Error("Cannot parse proxy list from /api/proxies");
@@ -93,7 +148,11 @@ async function fetchAllProxies(env) {
 async function fetchDetailedProxies(env, filtered) {
   var result = [];
   var concurrency = Number(env.FETCH_CONCURRENCY || "10");
-  var apiBase = env.ZENPROXY_BASE.replace(/\/$/, "");
+  var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
+
+  if (!concurrency || concurrency < 1) {
+    concurrency = 10;
+  }
 
   for (var i = 0; i < filtered.length; i += concurrency) {
     var batch = filtered.slice(i, i + concurrency);
@@ -101,7 +160,10 @@ async function fetchDetailedProxies(env, filtered) {
     var items = await Promise.all(
       batch.map(async function (meta) {
         var id = meta.id || meta.proxy_id;
-        if (!id) return null;
+
+        if (!id) {
+          return null;
+        }
 
         var url = new URL(apiBase + "/api/client/fetch");
         url.searchParams.set("api_key", env.ZENPROXY_API_KEY);
@@ -109,30 +171,60 @@ async function fetchDetailedProxies(env, filtered) {
 
         var res = await fetch(url.toString(), {
           headers: {
-            Authorization: "Bearer " + env.ZENPROXY_API_KEY
+            "Authorization": "Bearer " + env.ZENPROXY_API_KEY
           }
         });
 
-        if (!res.ok) return null;
+        if (!res.ok) {
+          return null;
+        }
 
         var data = await res.json();
-        var p = data.proxies && data.proxies[0];
-        if (!p) return null;
+
+        if (!data || !Array.isArray(data.proxies) || !data.proxies.length) {
+          return null;
+        }
+
+        var p = data.proxies[0];
 
         p.status = meta.status || p.status;
         p.original_name = meta.name || p.name || id;
-        p.quality = Object.assign({}, p.quality || {}, meta.quality || {});
+
+        var qualityA = p.quality || {};
+        var qualityB = meta.quality || {};
+        p.quality = mergeObjects(qualityA, qualityB);
 
         return p;
       })
     );
 
     for (var j = 0; j < items.length; j++) {
-      if (items[j]) result.push(items[j]);
+      if (items[j]) {
+        result.push(items[j]);
+      }
     }
   }
 
   return result;
+}
+
+function mergeObjects(a, b) {
+  var out = {};
+  var k;
+
+  for (k in a) {
+    if (Object.prototype.hasOwnProperty.call(a, k)) {
+      out[k] = a[k];
+    }
+  }
+
+  for (k in b) {
+    if (Object.prototype.hasOwnProperty.call(b, k)) {
+      out[k] = b[k];
+    }
+  }
+
+  return out;
 }
 
 function renameProxy(p) {
@@ -141,39 +233,53 @@ function renameProxy(p) {
   var original = cleanName(p.original_name || p.name || p.id || "Proxy");
   var country = cleanName(q.country || p.country || "未知国家");
 
-  var ipType = cleanName(
-    q.ip_type ||
-      q.ipType ||
-      q.network_type ||
-      q.asn_type ||
-      q.type ||
-      (q.is_residential ? "住宅IP" : "未知IP")
-  );
+  var ipType = q.ip_type ||
+    q.ipType ||
+    q.network_type ||
+    q.asn_type ||
+    q.type ||
+    "";
+
+  if (!ipType) {
+    if (q.is_residential === true) {
+      ipType = "住宅IP";
+    } else {
+      ipType = "未知IP";
+    }
+  }
+
+  ipType = cleanName(ipType);
 
   var gptOk =
     q.chatgpt === true ||
     q.chatgpt_accessible === true ||
     q.openai === true;
 
-  var gpt = gptOk ? "GPT可用" : "GPT不可用";
+  var gptText = gptOk ? "GPT可用" : "GPT不可用";
 
   var risk = getRiskScore(q);
   var riskText = risk === null ? "未知风险" : String(Math.round(risk));
 
-  return original + "-" + country + "-" + ipType + "-" + gpt + "-" + riskText;
+  return original + "-" + country + "-" + ipType + "-" + gptText + "-" + riskText;
 }
 
 function getRiskScore(q) {
-  if (!q) return null;
+  if (!q) {
+    return null;
+  }
 
   if (q.risk_score !== undefined && q.risk_score !== null) {
     var n1 = Number(q.risk_score);
-    return Number.isFinite(n1) ? n1 : null;
+    if (Number.isFinite(n1)) {
+      return n1;
+    }
   }
 
   if (q.risk !== undefined && q.risk !== null) {
     var n2 = Number(q.risk);
-    return Number.isFinite(n2) ? n2 : null;
+    if (Number.isFinite(n2)) {
+      return n2;
+    }
   }
 
   return null;
@@ -199,17 +305,15 @@ function toClashYaml(proxies) {
     var server = o.server || p.server;
     var port = o.server_port || o.port || p.port;
 
-    if (!type || !server || !port) continue;
+    if (!type || !server || !port) {
+      continue;
+    }
 
-    var clash = convertOutboundToClash({
-      name: name,
-      type: type,
-      server: server,
-      port: port,
-      outbound: o
-    });
+    var clash = convertOutboundToClash(name, type, server, port, o);
 
-    if (!clash) continue;
+    if (!clash) {
+      continue;
+    }
 
     proxyBlocks.push(clash);
     names.push(name);
@@ -235,6 +339,7 @@ function toClashYaml(proxies) {
   lines.push("  - name: 节点选择");
   lines.push("    type: select");
   lines.push("    proxies:");
+
   for (var b = 0; b < names.length; b++) {
     lines.push("      - " + quote(names[b]));
   }
@@ -246,6 +351,7 @@ function toClashYaml(proxies) {
   lines.push("    interval: 300");
   lines.push("    tolerance: 50");
   lines.push("    proxies:");
+
   for (var c = 0; c < names.length; c++) {
     lines.push("      - " + quote(names[c]));
   }
@@ -257,24 +363,18 @@ function toClashYaml(proxies) {
   return lines.join("\n");
 }
 
-function convertOutboundToClash(input) {
-  var name = input.name;
-  var type = input.type;
-  var server = input.server;
-  var port = input.port;
-  var outbound = input.outbound || {};
-
+function convertOutboundToClash(name, type, server, port, outbound) {
   if (type === "vless") {
     var obj1 = {
-      name: name,
-      type: "vless",
-      server: server,
-      port: port,
-      uuid: outbound.uuid,
-      network: getTransportType(outbound),
-      tls: !!(outbound.tls && outbound.tls.enabled),
-      servername: getTlsServerName(outbound),
-      flow: outbound.flow,
+      "name": name,
+      "type": "vless",
+      "server": server,
+      "port": Number(port),
+      "uuid": outbound.uuid,
+      "network": getTransportType(outbound),
+      "tls": getTlsEnabled(outbound),
+      "servername": getTlsServerName(outbound),
+      "flow": outbound.flow,
       "skip-cert-verify": true
     };
 
@@ -284,16 +384,16 @@ function convertOutboundToClash(input) {
 
   if (type === "vmess") {
     var obj2 = {
-      name: name,
-      type: "vmess",
-      server: server,
-      port: port,
-      uuid: outbound.uuid,
-      alterId: outbound.alter_id || outbound.alterId || 0,
-      cipher: outbound.security || "auto",
-      network: getTransportType(outbound),
-      tls: !!(outbound.tls && outbound.tls.enabled),
-      servername: getTlsServerName(outbound),
+      "name": name,
+      "type": "vmess",
+      "server": server,
+      "port": Number(port),
+      "uuid": outbound.uuid,
+      "alterId": outbound.alter_id || outbound.alterId || 0,
+      "cipher": outbound.security || "auto",
+      "network": getTransportType(outbound),
+      "tls": getTlsEnabled(outbound),
+      "servername": getTlsServerName(outbound),
       "skip-cert-verify": true
     };
 
@@ -303,12 +403,12 @@ function convertOutboundToClash(input) {
 
   if (type === "trojan") {
     var obj3 = {
-      name: name,
-      type: "trojan",
-      server: server,
-      port: port,
-      password: outbound.password,
-      sni: getTlsServerName(outbound),
+      "name": name,
+      "type": "trojan",
+      "server": server,
+      "port": Number(port),
+      "password": outbound.password,
+      "sni": getTlsServerName(outbound),
       "skip-cert-verify": true
     };
 
@@ -318,52 +418,62 @@ function convertOutboundToClash(input) {
 
   if (type === "shadowsocks" || type === "ss") {
     return {
-      name: name,
-      type: "ss",
-      server: server,
-      port: port,
-      cipher: outbound.method,
-      password: outbound.password
+      "name": name,
+      "type": "ss",
+      "server": server,
+      "port": Number(port),
+      "cipher": outbound.method,
+      "password": outbound.password
     };
   }
 
   if (type === "hysteria2" || type === "hy2") {
     return {
-      name: name,
-      type: "hysteria2",
-      server: server,
-      port: port,
-      password: outbound.password,
-      sni: getTlsServerName(outbound),
+      "name": name,
+      "type": "hysteria2",
+      "server": server,
+      "port": Number(port),
+      "password": outbound.password,
+      "sni": getTlsServerName(outbound),
       "skip-cert-verify": true
     };
   }
 
   if (type === "socks" || type === "socks5") {
     var obj4 = {
-      name: name,
-      type: "socks5",
-      server: server,
-      port: port
+      "name": name,
+      "type": "socks5",
+      "server": server,
+      "port": Number(port)
     };
 
-    if (outbound.username) obj4.username = outbound.username;
-    if (outbound.password) obj4.password = outbound.password;
+    if (outbound.username) {
+      obj4.username = outbound.username;
+    }
+
+    if (outbound.password) {
+      obj4.password = outbound.password;
+    }
 
     return obj4;
   }
 
   if (type === "http" || type === "https") {
     var obj5 = {
-      name: name,
-      type: "http",
-      server: server,
-      port: port,
-      tls: type === "https" || !!(outbound.tls && outbound.tls.enabled)
+      "name": name,
+      "type": "http",
+      "server": server,
+      "port": Number(port),
+      "tls": type === "https" || getTlsEnabled(outbound)
     };
 
-    if (outbound.username) obj5.username = outbound.username;
-    if (outbound.password) obj5.password = outbound.password;
+    if (outbound.username) {
+      obj5.username = outbound.username;
+    }
+
+    if (outbound.password) {
+      obj5.password = outbound.password;
+    }
 
     return obj5;
   }
@@ -371,36 +481,67 @@ function convertOutboundToClash(input) {
   return null;
 }
 
-function getTransportType(outbound) {
-  if (outbound.transport && outbound.transport.type) {
-    if (outbound.transport.type === "websocket") return "ws";
-    return outbound.transport.type;
+function getTlsEnabled(outbound) {
+  if (outbound && outbound.tls && outbound.tls.enabled) {
+    return true;
   }
 
-  return outbound.network || "tcp";
+  return false;
 }
 
 function getTlsServerName(outbound) {
-  if (outbound.tls && outbound.tls.server_name) return outbound.tls.server_name;
-  return outbound.server_name || "";
+  if (outbound && outbound.tls && outbound.tls.server_name) {
+    return outbound.tls.server_name;
+  }
+
+  if (outbound && outbound.server_name) {
+    return outbound.server_name;
+  }
+
+  return "";
+}
+
+function getTransportType(outbound) {
+  if (outbound && outbound.transport && outbound.transport.type) {
+    if (outbound.transport.type === "websocket") {
+      return "ws";
+    }
+
+    return outbound.transport.type;
+  }
+
+  if (outbound && outbound.network) {
+    return outbound.network;
+  }
+
+  return "tcp";
 }
 
 function applyTransport(obj, outbound) {
   var t = outbound.transport || {};
-  var type = t.type || outbound.network;
+  var type = t.type || outbound.network || "";
 
-  if (!type) return;
+  if (type === "websocket") {
+    type = "ws";
+  }
 
-  if (type === "ws" || type === "websocket") {
+  if (type === "ws") {
     obj.network = "ws";
-    obj["ws-opts"] = {
-      path: t.path || outbound.path || "/",
-      headers: t.headers || {}
+
+    var wsOpts = {
+      "path": t.path || outbound.path || "/",
+      "headers": {}
     };
 
-    if (t.host || outbound.host) {
-      obj["ws-opts"].headers.Host = t.host || outbound.host;
+    if (t.headers) {
+      wsOpts.headers = t.headers;
     }
+
+    if (t.host || outbound.host) {
+      wsOpts.headers.Host = t.host || outbound.host;
+    }
+
+    obj["ws-opts"] = wsOpts;
   }
 
   if (type === "grpc") {
@@ -419,15 +560,16 @@ function toV2rayUri(p) {
   var server = o.server || p.server;
   var port = o.server_port || o.port || p.port;
 
-  if (!type || !server || !port) return null;
+  if (!type || !server || !port) {
+    return null;
+  }
 
   if (type === "vless") {
     var uuid = o.uuid;
-    var security = o.tls && o.tls.enabled ? "tls" : "none";
+    var security = getTlsEnabled(o) ? "tls" : "none";
     var sni = getTlsServerName(o);
 
-    return (
-      "vless://" +
+    return "vless://" +
       uuid +
       "@" +
       server +
@@ -438,16 +580,14 @@ function toV2rayUri(p) {
       "&sni=" +
       encodeURIComponent(sni) +
       "#" +
-      name
-    );
+      name;
   }
 
   if (type === "trojan") {
     var password = encodeURIComponent(o.password || "");
     var sni2 = getTlsServerName(o);
 
-    return (
-      "trojan://" +
+    return "trojan://" +
       password +
       "@" +
       server +
@@ -456,12 +596,14 @@ function toV2rayUri(p) {
       "?security=tls&sni=" +
       encodeURIComponent(sni2) +
       "#" +
-      name
-    );
+      name;
   }
 
   if (type === "shadowsocks" || type === "ss") {
-    var userInfo = btoa(String(o.method || "") + ":" + String(o.password || ""));
+    var method = String(o.method || "");
+    var pass = String(o.password || "");
+    var userInfo = btoa(method + ":" + pass);
+
     return "ss://" + userInfo + "@" + server + ":" + port + "#" + name;
   }
 
@@ -470,15 +612,21 @@ function toV2rayUri(p) {
 
 function yamlInline(obj) {
   var parts = [];
+  var k;
 
-  for (var k in obj) {
-    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+  for (k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) {
+      continue;
+    }
 
     var v = obj[k];
-    if (v === undefined || v === null || v === "") continue;
+
+    if (v === undefined || v === null || v === "") {
+      continue;
+    }
 
     if (typeof v === "boolean" || typeof v === "number") {
-      parts.push(k + ": " + v);
+      parts.push(k + ": " + String(v));
     } else if (typeof v === "object") {
       parts.push(k + ": " + yamlObject(v));
     } else {
@@ -491,17 +639,23 @@ function yamlInline(obj) {
 
 function yamlObject(obj) {
   var parts = [];
+  var k;
 
-  for (var k in obj) {
-    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+  for (k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) {
+      continue;
+    }
 
     var v = obj[k];
-    if (v === undefined || v === null || v === "") continue;
 
-    if (typeof v === "object") {
+    if (v === undefined || v === null || v === "") {
+      continue;
+    }
+
+    if (typeof v === "boolean" || typeof v === "number") {
+      parts.push(k + ": " + String(v));
+    } else if (typeof v === "object") {
       parts.push(k + ": " + yamlObject(v));
-    } else if (typeof v === "boolean" || typeof v === "number") {
-      parts.push(k + ": " + v);
     } else {
       parts.push(k + ": " + quote(String(v)));
     }
@@ -525,46 +679,11 @@ function base64Utf8(str) {
   return btoa(binary);
 }
 
-function text(body, status) {
-  return new Response(body, {
+function textResponse(body, status) {
+  return new Response(String(body), {
     status: status || 200,
     headers: {
       "content-type": "text/plain; charset=utf-8"
     }
   });
 }
-  var env = context.env;
-  var url = new URL(request.url);
-
-  var target = (url.searchParams.get("target") || "clash").toLowerCase();
-  var count = Number(url.searchParams.get("count") || "200");
-
-  var statusFilter = (url.searchParams.get("status") || "valid").toLowerCase();
-  var qualityFilter = (url.searchParams.get("quality") || "chatgpt").toLowerCase();
-
-  var countryFilter = url.searchParams.get("country");
-  var typeFilter = url.searchParams.get("type");
-  var riskMax = url.searchParams.get("risk_max")
-    ? Number(url.searchParams.get("risk_max"))
-    : null;
-
-  if (!env.ZENPROXY_BASE || !env.ZENPROXY_API_KEY) {
-    return text("Missing ZENPROXY_BASE or ZENPROXY_API_KEY", 500);
-  }
-
-  try {
-    var all = await fetchAllProxies(env);
-
-    var filtered = all.filter(function (p) {
-      var status = String(p.status || "").toLowerCase();
-      var q = p.quality || {};
-
-      var chatgptOk =
-        q.chatgpt === true ||
-        q.chatgpt_accessible === true ||
-        q.openai === true;
-
-      var country = q.country || p.country;
-      var type = p.type || p.proxy_type;
-      var risk = getRiskScore(q);
-

@@ -11,7 +11,7 @@ async function fetchAllProxies(env) {
 
   const res = await fetch(url.toString(), {
     headers: {
-      Authorization: `Bearer ${env.ZENPROXY_API_KEY}`,
+      Authorization: "Bearer " + env.ZENPROXY_API_KEY,
     },
   });
 
@@ -54,7 +54,7 @@ async function fetchDetailedProxies(env, filtered) {
 
         const res = await fetch(url.toString(), {
           headers: {
-            Authorization: `Bearer ${env.ZENPROXY_API_KEY}`,
+            Authorization: "Bearer " + env.ZENPROXY_API_KEY,
           },
         });
 

@@ -1,5 +1,5 @@
 export async function onRequest(context) {
-    var request = context.request;
+      var request = context.request;
       if (qualityFilter === "chatgpt" && !chatgptOk) return false;
 
       if (

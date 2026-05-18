@@ -3,7 +3,13 @@ export async function onRequest(context) {
   var env = context.env;
   var url = new URL(request.url);
 
-  var target = (url.searchParams.get("target") || "clash").to toPositiveInt(url.searchParams.get("count"), 50);  var target = (url.searchParams.get("target") || "clash").toLowerCase();
+  var target = (url.searchParams.get("target") || "clash").toLowerCase();
+
+  var count = Number(url.searchParams.get("count") || "50");
+  if (!Number.isFinite(count) || count <= 0) {
+    count = 50;
+  }
+  count = Math.floor(count);
 
   var statusFilter = (url.searchParams.get("status") || "any").toLowerCase();
   var qualityFilter = (url.searchParams.get("quality") || "any").toLowerCase();
@@ -21,13 +27,24 @@ export async function onRequest(context) {
 
   var debug = url.searchParams.get("debug") === "1";
 
-  // valid 模式下扫描分页的参数
-  var scanPages = toPositiveInt(url.searchParams.get("scan_pages"), 8);
-  var perPage = toPositiveInt(url.searchParams.get("per_page"), 1000);
+  var scanPages = Number(url.searchParams.get("scan_pages") || "8");
+  if (!Number.isFinite(scanPages) || scanPages <= 0) {
+    scanPages = 8;
+  }
+  scanPages = Math.floor(scanPages);
 
-  // Cloudflare Free 下建议保守一点，避免 50 个 subrequests 上限
-  // status=valid 路径需要：若干页 /api/proxies + 按 proxy_id 查详情
-  var maxValidExport = toPositiveInt(env.MAX_VALID_EXPORT, 40);
+  var perPage = Number(url.searchParams.get("per_page") || "1000");
+  if (!Number.isFinite(perPage) || perPage <= 0) {
+    perPage = 1000;
+  }
+  perPage = Math.floor(perPage);
+
+  var maxValidExport = Number(env.MAX_VALID_EXPORT || "40");
+  if (!Number.isFinite(maxValidExport) || maxValidExport <= 0) {
+    maxValidExport = 40;
+  }
+  maxValidExport = Math.floor(maxValidExport);
+
   if (statusFilter === "valid" && count > maxValidExport) {
     count = maxValidExport;
   }
@@ -37,7 +54,6 @@ export async function onRequest(context) {
   }
 
   try {
-    // 路径 A：status=any 时，直接一次请求 /api/client/fetch
     if (statusFilter !== "valid") {
       var directProxies = await fetchDirectProxies(
         env,
@@ -57,7 +73,7 @@ export async function onRequest(context) {
           country: countryFilter,
           type: typeFilter,
           risk_max: riskMax
-        });
+        }, 200);
       }
 
       if (!directProxies.length) {
@@ -67,7 +83,6 @@ export async function onRequest(context) {
       return buildSubscriptionResponse(target, directProxies);
     }
 
-    // 路径 B：status=valid 时，扫描分页的 /api/proxies，再按 proxy_id 补详细 outbound
     var scanResult = await collectValidProxyMetas(
       env,
       count,
@@ -80,7 +95,7 @@ export async function onRequest(context) {
     );
 
     if (debug) {
-      return jsonResponse(scanResult.stats);
+      return jsonResponse(scanResult.stats, 200);
     }
 
     if (!scanResult.metas.length) {
@@ -99,45 +114,7 @@ export async function onRequest(context) {
   }
 }
 
-/* -------------------- 核心导出逻辑 -------------------- */
-
-function buildSubscriptionResponse(target, proxies) {
-  if (target === "v2ray" || target === "base64") {
-    var lines = [];
-    for (var i = 0; i < proxies.length; i++) {
-      var uri = toV2rayUri(proxies[i]);
-      if (uri) {
-        lines.push(uri);
-      }
-    }
-
-    if (!lines.length) {
-      return textResponse("No nodes could be converted to V2Ray subscription", 404);
-    }
-
-    return new Response(base64Utf8(lines.join("\n")), {
-      headers: {
-        "content-type": "text/plain; charset=utf-8",
-        "profile-update-interval": "6"
-      }
-    });
-  }
-
-  var yaml = toClashYaml(proxies);
-
-  if (!yaml) {
-    return textResponse("No nodes could be converted to Clash subscription", 404);
-  }
-
-  return new Response(yaml, {
-    headers: {
-      "content-type": "text/yaml; charset=utf-8",
-      "profile-update-interval": "6"
-    }
-  });
-}
-
-/* -------------------- 路径 A：status=any 直接批量拉 -------------------- */
+/* -------------------- 路径 A：status=any 直接拉 /api/client/fetch -------------------- */
 
 async function fetchDirectProxies(env, count, qualityFilter, countryFilter, typeFilter, riskMax) {
   var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
@@ -158,7 +135,7 @@ async function fetchDirectProxies(env, count, qualityFilter, countryFilter, type
     url.searchParams.set("type", typeFilter);
   }
 
-  if (riskMax !== null && riskMax !== undefined) {
+  if (riskMax !== null) {
     url.searchParams.set("risk_max", String(riskMax));
   }
 
@@ -175,8 +152,6 @@ async function fetchDirectProxies(env, count, qualityFilter, countryFilter, type
   var data = await res.json();
   var list = extractProxyList(data);
 
-  // direct 模式拿不到 status，本身也不需要 status
-  // quality 字段保留即可
   for (var i = 0; i < list.length; i++) {
     if (!list[i].original_name) {
       list[i].original_name = list[i].name || list[i].id || "Proxy";
@@ -186,7 +161,7 @@ async function fetchDirectProxies(env, count, qualityFilter, countryFilter, type
   return list;
 }
 
-/* -------------------- 路径 B：status=valid 扫描分页 -------------------- */
+/* -------------------- 路径 B：status=valid 扫描分页 /api/proxies -------------------- */
 
 async function collectValidProxyMetas(
   env,
@@ -282,7 +257,7 @@ async function collectValidProxyMetas(
         }
       }
 
-      if (riskMax !== null && riskMax !== undefined) {
+      if (riskMax !== null) {
         var risk = getRiskScore(q);
         if (risk !== null && risk > riskMax) {
           continue;
@@ -308,7 +283,6 @@ async function collectValidProxyMetas(
       break;
     }
 
-    // 如果这一页不足 per_page，通常说明已经到末尾
     if (pageList.length < perPage) {
       break;
     }
@@ -324,12 +298,13 @@ async function collectValidProxyMetas(
 
 async function fetchDetailedByIds(env, metas) {
   var result = [];
-  var concurrency = toPositiveInt(env.FETCH_CONCURRENCY, 8);
-  var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
-
-  if (concurrency < 1) {
+  var concurrency = Number(env.FETCH_CONCURRENCY || "8");
+  if (!Number.isFinite(concurrency) || concurrency <= 0) {
     concurrency = 8;
   }
+  concurrency = Math.floor(concurrency);
+
+  var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
 
   for (var i = 0; i < metas.length; i += concurrency) {
     var batch = metas.slice(i, i + concurrency);
@@ -356,13 +331,13 @@ async function fetchDetailedByIds(env, metas) {
 
         var data = await res.json();
         var list = extractProxyList(data);
+
         if (!list.length) {
           return null;
         }
 
         var p = list[0];
 
-        // 合并 meta 里更完整的 status / ip_type / quality
         p.status = meta.status || p.status;
         p.original_name = meta.name || p.name || meta.id;
         p.type = meta.type || p.type;
@@ -389,7 +364,46 @@ async function fetchDetailedByIds(env, metas) {
   return result;
 }
 
-/* -------------------- 通用辅助 -------------------- */
+/* -------------------- 订阅输出 -------------------- */
+
+function buildSubscriptionResponse(target, proxies) {
+  if (target === "v2ray" || target === "base64") {
+    var lines = [];
+
+    for (var i = 0; i < proxies.length; i++) {
+      var uri = toV2rayUri(proxies[i]);
+      if (uri) {
+        lines.push(uri);
+      }
+    }
+
+    if (!lines.length) {
+      return textResponse("No nodes could be converted to V2Ray subscription", 404);
+    }
+
+    return new Response(base64Utf8(lines.join("\n")), {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "profile-update-interval": "6"
+      }
+    });
+  }
+
+  var yaml = toClashYaml(proxies);
+
+  if (!yaml) {
+    return textResponse("No nodes could be converted to Clash subscription", 404);
+  }
+
+  return new Response(yaml, {
+    headers: {
+      "content-type": "text/yaml; charset=utf-8",
+      "profile-update-interval": "6"
+    }
+  });
+}
+
+/* -------------------- 工具函数 -------------------- */
 
 function extractProxyList(data) {
   if (!data) {
@@ -458,14 +472,6 @@ function mergeObjects(a, b) {
   return out;
 }
 
-function toPositiveInt(value, defaultValue) {
-  var n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) {
-    return defaultValue;
-  }
-  return Math.floor(n);
-}
-
 function getRiskScore(q) {
   if (!q) {
     return null;
@@ -495,7 +501,7 @@ function cleanName(s) {
     .trim();
 }
 
-/* -------------------- 节点重命名 -------------------- */
+/* -------------------- 重命名 -------------------- */
 
 function renameProxy(p) {
   var q = p.quality || {};
@@ -533,7 +539,7 @@ function renameProxy(p) {
   return original + "-" + country + "-" + ipType + "-" + gptText + "-" + riskText;
 }
 
-/* -------------------- Clash YAML 导出 -------------------- */
+/* -------------------- Clash YAML -------------------- */
 
 function toClashYaml(proxies) {
   var proxyBlocks = [];
@@ -567,7 +573,6 @@ function toClashYaml(proxies) {
   }
 
   var lines = [];
-
   lines.push("mixed-port: 7890");
   lines.push("allow-lan: false");
   lines.push("mode: rule");
@@ -582,7 +587,6 @@ function toClashYaml(proxies) {
 
   lines.push("");
   lines.push("proxy-groups:");
-
   lines.push("  - name: 节点选择");
   lines.push("    type: select");
   lines.push("    proxies:");
@@ -793,7 +797,7 @@ function applyTransport(obj, outbound) {
   }
 }
 
-/* -------------------- V2Ray/Base64 导出 -------------------- */
+/* -------------------- V2Ray -------------------- */
 
 function toV2rayUri(p) {
   var o = p.outbound || {};
@@ -853,7 +857,7 @@ function toV2rayUri(p) {
   return null;
 }
 
-/* -------------------- YAML 序列化 -------------------- */
+/* -------------------- YAML 工具 -------------------- */
 
 function yamlInline(obj) {
   var parts = [];
@@ -865,7 +869,6 @@ function yamlInline(obj) {
     }
 
     var v = obj[k];
-
     if (v === undefined || v === null || v === "") {
       continue;
     }
@@ -892,7 +895,6 @@ function yamlObject(obj) {
     }
 
     var v = obj[k];
-
     if (v === undefined || v === null || v === "") {
       continue;
     }
@@ -913,7 +915,7 @@ function quote(s) {
   return JSON.stringify(String(s));
 }
 
-/* -------------------- 响应工具 -------------------- */
+/* -------------------- 响应 -------------------- */
 
 function base64Utf8(str) {
   var bytes = new TextEncoder().encode(str);

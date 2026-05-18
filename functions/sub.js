@@ -45,6 +45,7 @@ export async function onRequest(context) {
   }
   maxValidExport = Math.floor(maxValidExport);
 
+  // status=valid 路径下，为了避免 Cloudflare Free 的 subrequest 限制，保守封顶
   if (statusFilter === "valid" && count > maxValidExport) {
     count = maxValidExport;
   }
@@ -54,6 +55,7 @@ export async function onRequest(context) {
   }
 
   try {
+    // 路径 A：status=any 直接调用 /api/client/fetch，一次取多条，避免 50 subrequests 限制
     if (statusFilter !== "valid") {
       var directProxies = await fetchDirectProxies(
         env,
@@ -83,6 +85,7 @@ export async function onRequest(context) {
       return buildSubscriptionResponse(target, directProxies);
     }
 
+    // 路径 B：status=valid 时，扫描分页 /api/proxies 再按 proxy_id 拿详细 outbound
     var scanResult = await collectValidProxyMetas(
       env,
       count,
@@ -175,6 +178,7 @@ async function collectValidProxyMetas(
 ) {
   var apiBase = String(env.ZENPROXY_BASE).replace(/\/$/, "");
   var matched = [];
+  var seenIds = {};
 
   var stats = {
     mode: "valid-scan",
@@ -211,12 +215,22 @@ async function collectValidProxyMetas(
     stats.pages_scanned += 1;
     stats.proxies_scanned += pageList.length;
 
-    if (!pageList.length) {
+    // 只有空页才停止，不再因为 pageList.length < perPage 提前 break
+    if (pageList.length === 0) {
       break;
     }
 
     for (var i = 0; i < pageList.length; i++) {
       var p = pageList[i];
+      var currentId = p.id || p.proxy_id || "";
+
+      if (currentId && seenIds[currentId]) {
+        continue;
+      }
+      if (currentId) {
+        seenIds[currentId] = true;
+      }
+
       var q = p.quality || {};
 
       var isValid = String(p.status || "").toLowerCase() === "valid";
@@ -280,10 +294,6 @@ async function collectValidProxyMetas(
     }
 
     if (matched.length >= wantedCount) {
-      break;
-    }
-
-    if (pageList.length < perPage) {
       break;
     }
   }

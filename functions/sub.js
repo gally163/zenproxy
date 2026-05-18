@@ -11,6 +11,7 @@ export async function onRequest(context) {
 
   var countryFilter = url.searchParams.get("country");
   var typeFilter = url.searchParams.get("type");
+  var debug = url.searchParams.get("debug") === "1";
 
   var riskMax = null;
   if (url.searchParams.get("risk_max")) {
@@ -24,6 +25,8 @@ export async function onRequest(context) {
   try {
     var allProxies = await fetchAllProxies(env);
 
+    var beforeCount = allProxies.length;
+
     var filtered = allProxies.filter(function (p) {
       var status = String(p.status || "").toLowerCase();
       var q = p.quality || {};
@@ -33,16 +36,30 @@ export async function onRequest(context) {
         q.chatgpt_accessible === true ||
         q.openai === true;
 
+      var googleOk =
+        q.google === true ||
+        q.google_accessible === true;
+
       var country = q.country || p.country || "";
-      var proxyType = p.type || p.proxy_type || "";
+      var proxyType = String(p.type || p.proxy_type || "").toLowerCase();
       var risk = getRiskScore(q);
 
-      if (statusFilter === "valid" && status !== "valid") {
-        return false;
+      if (statusFilter !== "any" && statusFilter !== "") {
+        if (status !== statusFilter) {
+          return false;
+        }
       }
 
       if (qualityFilter === "chatgpt" && !chatgptOk) {
         return false;
+      }
+
+      if (qualityFilter === "google" && !googleOk) {
+        return false;
+      }
+
+      if (qualityFilter === "any" || qualityFilter === "") {
+        // no quality filter
       }
 
       if (countryFilter) {
@@ -52,7 +69,7 @@ export async function onRequest(context) {
       }
 
       if (typeFilter) {
-        if (String(proxyType).toLowerCase() !== typeFilter.toLowerCase()) {
+        if (proxyType !== typeFilter.toLowerCase()) {
           return false;
         }
       }
@@ -64,10 +81,44 @@ export async function onRequest(context) {
       return true;
     });
 
+    var afterFilterCount = filtered.length;
     filtered = filtered.slice(0, count);
 
+    if (debug) {
+      return jsonResponse({
+        ok: true,
+        step: "filter",
+        before_count: beforeCount,
+        after_filter_count: afterFilterCount,
+        after_slice_count: filtered.length,
+        request: {
+          target: target,
+          count: count,
+          status: statusFilter,
+          quality: qualityFilter,
+          country: countryFilter,
+          type: typeFilter,
+          risk_max: riskMax
+        },
+        first_5_filtered: filtered.slice(0, 5).map(function (p) {
+          var q = p.quality || {};
+          return {
+            id: p.id || p.proxy_id || null,
+            name: p.name || null,
+            type: p.type || p.proxy_type || null,
+            status: p.status || null,
+            country: q.country || null,
+            chatgpt: q.chatgpt === true || q.chatgpt_accessible === true || false,
+            google: q.google === true || q.google_accessible === true || false,
+            risk_score: q.risk_score !== undefined ? q.risk_score : (q.risk !== undefined ? q.risk : null),
+            ip_type: q.ip_type || q.ipType || q.type || (q.is_residential ? "住宅IP" : null)
+          };
+        })
+      });
+    }
+
     if (!filtered.length) {
-      return textResponse("No proxies matched: status=valid and quality=chatgpt", 404);
+      return textResponse("No proxies matched: status=" + statusFilter + " and quality=" + qualityFilter, 404);
     }
 
     var detailed = await fetchDetailedProxies(env, filtered);
@@ -81,6 +132,10 @@ export async function onRequest(context) {
         return !!x;
       });
 
+      if (!uriLines.length) {
+        return textResponse("No V2Ray-compatible nodes after conversion", 404);
+      }
+
       return new Response(base64Utf8(uriLines.join("\n")), {
         headers: {
           "content-type": "text/plain; charset=utf-8",
@@ -90,6 +145,10 @@ export async function onRequest(context) {
     }
 
     var yaml = toClashYaml(detailed);
+
+    if (!yaml) {
+      return textResponse("No Clash-compatible nodes after conversion", 404);
+    }
 
     return new Response(yaml, {
       headers: {
@@ -119,24 +178,7 @@ async function fetchAllProxies(env) {
   }
 
   var data = await res.json();
-
-  var list = [];
-
-  if (Array.isArray(data)) {
-    list = data;
-  } else if (Array.isArray(data.proxies)) {
-    list = data.proxies;
-  } else if (Array.isArray(data.data)) {
-    list = data.data;
-  } else if (Array.isArray(data.items)) {
-    list = data.items;
-  } else if (Array.isArray(data.results)) {
-    list = data.results;
-  } else if (data.data && Array.isArray(data.data.proxies)) {
-    list = data.data.proxies;
-  } else if (data.result && Array.isArray(data.result.proxies)) {
-    list = data.result.proxies;
-  }
+  var list = extractProxyList(data);
 
   if (!Array.isArray(list)) {
     throw new Error("Cannot parse proxy list from /api/proxies");
@@ -189,10 +231,7 @@ async function fetchDetailedProxies(env, filtered) {
 
         p.status = meta.status || p.status;
         p.original_name = meta.name || p.name || id;
-
-        var qualityA = p.quality || {};
-        var qualityB = meta.quality || {};
-        p.quality = mergeObjects(qualityA, qualityB);
+        p.quality = mergeObjects(p.quality || {}, meta.quality || {});
 
         return p;
       })
@@ -206,6 +245,50 @@ async function fetchDetailedProxies(env, filtered) {
   }
 
   return result;
+}
+
+function extractProxyList(data) {
+  if (!data) {
+    return [];
+  }
+
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  if (Array.isArray(data.proxies)) {
+    return data.proxies;
+  }
+
+  if (Array.isArray(data.items)) {
+    return data.items;
+  }
+
+  if (Array.isArray(data.results)) {
+    return data.results;
+  }
+
+  if (Array.isArray(data.data)) {
+    return data.data;
+  }
+
+  if (data.data && Array.isArray(data.data.proxies)) {
+    return data.data.proxies;
+  }
+
+  if (data.data && Array.isArray(data.data.items)) {
+    return data.data.items;
+  }
+
+  if (data.data && Array.isArray(data.data.results)) {
+    return data.data.results;
+  }
+
+  if (data.result && Array.isArray(data.result.proxies)) {
+    return data.result.proxies;
+  }
+
+  return [];
 }
 
 function mergeObjects(a, b) {
@@ -233,7 +316,8 @@ function renameProxy(p) {
   var original = cleanName(p.original_name || p.name || p.id || "Proxy");
   var country = cleanName(q.country || p.country || "未知国家");
 
-  var ipType = q.ip_type ||
+  var ipType =
+    q.ip_type ||
     q.ipType ||
     q.network_type ||
     q.asn_type ||
@@ -319,6 +403,10 @@ function toClashYaml(proxies) {
     names.push(name);
   }
 
+  if (!proxyBlocks.length) {
+    return "";
+  }
+
   var lines = [];
 
   lines.push("mixed-port: 7890");
@@ -335,7 +423,6 @@ function toClashYaml(proxies) {
 
   lines.push("");
   lines.push("proxy-groups:");
-
   lines.push("  - name: 节点选择");
   lines.push("    type: select");
   lines.push("    proxies:");
@@ -482,11 +569,7 @@ function convertOutboundToClash(name, type, server, port, outbound) {
 }
 
 function getTlsEnabled(outbound) {
-  if (outbound && outbound.tls && outbound.tls.enabled) {
-    return true;
-  }
-
-  return false;
+  return !!(outbound && outbound.tls && outbound.tls.enabled);
 }
 
 function getTlsServerName(outbound) {
@@ -564,8 +647,43 @@ function toV2rayUri(p) {
     return null;
   }
 
+  if (type === "vmess") {
+    var vmessObj = {
+      "v": "2",
+      "ps": renameProxy(p),
+      "add": server,
+      "port": String(port),
+      "id": o.uuid || "",
+      "aid": String(o.alter_id || o.alterId || 0),
+      "scy": o.security || "auto",
+      "net": getTransportType(o),
+      "type": "none",
+      "host": "",
+      "path": "",
+      "tls": getTlsEnabled(o) ? "tls" : "",
+      "sni": getTlsServerName(o)
+    };
+
+    if (o.transport && o.transport.type) {
+      if (o.transport.type === "websocket" || o.transport.type === "ws") {
+        vmessObj.net = "ws";
+        vmessObj.path = o.transport.path || "/";
+        if (o.transport.host) {
+          vmessObj.host = o.transport.host;
+        }
+      }
+      if (o.transport.type === "grpc") {
+        vmessObj.net = "grpc";
+        vmessObj.path = o.transport.service_name || "";
+      }
+    }
+
+    var vmessJson = JSON.stringify(vmessObj);
+    return "vmess://" + base64Utf8(vmessJson);
+  }
+
   if (type === "vless") {
-    var uuid = o.uuid;
+    var uuid = o.uuid || "";
     var security = getTlsEnabled(o) ? "tls" : "none";
     var sni = getTlsServerName(o);
 
@@ -607,6 +725,7 @@ function toV2rayUri(p) {
     return "ss://" + userInfo + "@" + server + ":" + port + "#" + name;
   }
 
+  // 其他协议不输出到 V2Ray 订阅
   return null;
 }
 
@@ -687,3 +806,13 @@ function textResponse(body, status) {
     }
   });
 }
+
+function jsonResponse(obj) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8"
+    }
+  });
+}
+``
